@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 Simulador — Estados de los Procesos
