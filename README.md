@@ -6,7 +6,7 @@ Instrucciones de instalacion.
 - Tambien necesitas tener instalado python en tu computadora.
 - Abre VSCode e instala las extensiones de python by microsoft.
 - Verifica que tambien tengas instalado las extensiones pylance y python debugger.
-- Ahora necesitas instalar pyside6, abre la terminal de VSCode y ejecuta las siguentes lineas de comandos:
+- Ahora necesitas instalar pyside6, abre la terminal de VSCode y ejecuta las siguentes lineas de comandos.
       python -m venv .venv
       .venv\Scripts\activate
       pip install PySide6
