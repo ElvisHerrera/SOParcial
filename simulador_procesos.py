@@ -427,7 +427,7 @@ class Scheduler:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Simulador — Vista Única (FCFS + Dependencias + Control manual + Prioridades)")
+        self.setWindowTitle("Simulador — Estados de los Procesos")
         self.scheduler = Scheduler(simulate_zombie=False, repeat_mode=True)
         self.timer = QTimer(self); self.timer.timeout.connect(self.on_tick)
         self.init_ui()
