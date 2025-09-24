@@ -1,12 +1,21 @@
 
 # -*- coding: utf-8 -*-
-'Simulador — Estados de los Procesos'
+"""
+Simulador — Estados de los Procesos (orden RUNNING primero)
+- RUNNING siempre se muestra en la primera fila, en verde y con estado "Ejecución".
+- Solo el proceso RUNNING aparece en verde (no se resaltan procesos previos).
+- El primer proceso agregado queda en "Listo" hasta que corre el reloj.
+- READY -> "Listo". Bloqueado no consume CPU. Zombi al finalizar: 0.10.
+- FINISHED se limpia tras 6 ticks.
+- Prioridades automáticas (Alta/Media/Baja) con RR ponderado + quanta (3/2/1).
+- Bloqueos I/O y dependencias automáticos.
+"""
 
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Deque, List, Dict, Tuple
-from collections import deque, defaultdict
+from typing import Optional, Deque, List, Tuple
+from collections import deque
 import random
 
 from PySide6.QtCore import QTimer, QSize
@@ -16,15 +25,14 @@ from PySide6.QtWidgets import (
     QHeaderView, QVBoxLayout, QHBoxLayout, QGroupBox, QSizePolicy, QScrollArea, QToolButton, QStyle, QInputDialog
 )
 
-# --------- Constantes del simulador ---------
-DEFAULT_TICK_MS = 800           # 1) velocidad por defecto
-P_BLOCK_IO = 0.05               # 4) prob. de bloqueo I/O en cada tick del RUNNING
-P_DEPEND_ON_ADMIT = 0.15        # 10) prob. de que un proceso adquiera dependencia al admitirse
-P_DEPEND_REPLY = 0.45           # 10) prob. de que el RUNNING responda y libere a sus dependientes en un tick
-P_FINISH_TO_ZOMBIE = 0.10       # 2) prob. de quedar en ZOMBIE al finalizar
-FINISHED_TTL = 6                # 11) ticks que permanece visible un FINISHED
+# --------- Constantes ---------
+DEFAULT_TICK_MS = 800
+P_BLOCK_IO = 0.05
+P_DEPEND_ON_ADMIT = 0.15
+P_DEPEND_REPLY = 0.45
+P_FINISH_TO_ZOMBIE = 0.10
+FINISHED_TTL = 6
 
-# 50 aplicaciones/servicios para demo y nombres automáticos
 APPS_50 = [
     "Word","Excel","PowerPoint","Outlook","OneNote",
     "Teams","Zoom","Slack","Discord","Skype",
@@ -38,12 +46,12 @@ APPS_50 = [
     "Apache","VirtualBox","VMware Workstation","Windows Update","Defender"
 ]
 
-# ---------------- Enumerados y etiquetas ----------------
+# ---------------- Enumerados ----------------
 class ProcessState(Enum):
     NEW = auto()
     READY = auto()
     RUNNING = auto()
-    BLOCKED = auto()    # Solo I/O o Dependencia
+    BLOCKED = auto()
     FINISHED = auto()
     ZOMBIE = auto()
 
@@ -57,7 +65,7 @@ class Priority(Enum):
     LOW = auto()
 
 PRIO_LABEL = {Priority.HIGH:"Alta", Priority.MEDIUM:"Media", Priority.LOW:"Baja"}
-PRIO_QUANTUM = {Priority.HIGH:3, Priority.MEDIUM:2, Priority.LOW:1}  # ticks seguidos por proceso
+PRIO_QUANTUM = {Priority.HIGH:3, Priority.MEDIUM:3, Priority.LOW:2}
 
 STATE_COLORS = {
     ProcessState.NEW: QColor(66,135,245),
@@ -69,11 +77,10 @@ STATE_COLORS = {
 }
 
 STATE_LABEL_ES = {
-ProcessState.RUNNING: "Ejecución",
+    ProcessState.RUNNING: "Ejecución",
     ProcessState.READY: "Listo",
     ProcessState.BLOCKED: "Bloqueado",
     ProcessState.FINISHED: "Finalizado",
-
 }
 REASON_LABEL_ES = {
     BlockReason.DEPENDENCY: "Dependencia",
@@ -93,25 +100,23 @@ class Process:
     waiting_for_pid: Optional[int] = None
     io_remaining: int = 0
     priority: Priority = Priority.MEDIUM
-    # Consumos simulados (base y valores actuales)
+    # Consumo simulado
     cpu_base: float = 0.0
     mem_base: int = 0
     disk_base: float = 0.0
     cpu_usage: float = 0.0
     mem_usage: int = 0
     disk_usage: float = 0.0
-    # Marcas y tiempos
-    finished_at: Optional[int] = None   # 11) cuándo pasó a FINISHED (para limpieza)
-    has_replied: bool = False           # 10) si ya "respondió" a dependientes (auto)
-    has_executed: bool = False          # para métricas de dependencias
+    # Marcas
+    finished_at: Optional[int] = None
+    has_executed: bool = False
 
     def set_state(self, st: ProcessState):
         self.state = st
 
 # ---------------- Planificador ----------------
 class Scheduler:
-    # 9) Prioridades se asignan automáticamente; se mantiene RR con pesos por clase
-    WRR_WEIGHTS = {Priority.HIGH:2, Priority.MEDIUM:1, Priority.LOW:1}
+    WRR_WEIGHTS = {Priority.HIGH:3, Priority.MEDIUM:2, Priority.LOW:2}
     PRIO_CYCLE = [Priority.HIGH, Priority.MEDIUM, Priority.LOW]
 
     def __init__(self):
@@ -128,22 +133,18 @@ class Scheduler:
         self._rnd = random.Random()
         self._quantum_used: int = 0
 
-        # Estado del WRR por clase
         self._wrr_idx: int = 0
         self._wrr_budget: int = self.WRR_WEIGHTS[self.PRIO_CYCLE[self._wrr_idx]]
 
-    # ---- utilidades nombres/recursos ----
+    # ---- utilidades ----
     def _all_processes(self) -> List[Process]:
         out = []
         if self.running: out.append(self.running)
         out += list(self.ready) + self.blocked + self.finished + self.zombies + self.new
         return out
 
-    def _existing_names(self) -> List[str]:
-        return [p.name for p in self._all_processes()]
-
     def unique_name(self, base: str) -> str:
-        names = set(self._existing_names())
+        names = {p.name for p in self._all_processes()}
         if base not in names: return base
         i = 1
         while True:
@@ -155,18 +156,13 @@ class Scheduler:
         return self.unique_name(self._rnd.choice(APPS_50))
 
     def _init_resources(self) -> Tuple[float,int,float]:
-        # Valores base razonables
-        cpu = self._rnd.uniform(5, 30)
-        mem = self._rnd.randint(100, 800)
-        disk = self._rnd.uniform(0.5, 8.0)
-        return cpu, mem, disk
+        return self._rnd.uniform(5,30), self._rnd.randint(100,800), self._rnd.uniform(0.5,8.0)
 
     def _jitter(self, val: float, lo: float, hi: float, scale: float=0.1) -> float:
         delta = (self._rnd.random()*2-1) * scale * max(1.0, val)
         return max(lo, min(hi, val + delta))
 
     def _update_resources_for(self, p: Process):
-        # 1) RUNNING sube consumo; 2) READY/NEW bajo; 3) BLOCKED depende; 4) FINISHED=0; 5) ZOMBIE poco
         if p.state == ProcessState.RUNNING:
             p.cpu_usage = self._jitter(max(p.cpu_usage, p.cpu_base+10), 1, 100, 0.15)
             p.disk_usage = self._jitter(max(p.disk_usage, p.disk_base+1.0), 0.0, 60.0, 0.20)
@@ -176,7 +172,7 @@ class Scheduler:
             p.disk_usage = self._jitter(p.disk_base*0.7, 0.0, 20.0, 0.15)
             p.mem_usage  = int(self._jitter(p.mem_base, 50, 4096, 0.02))
         elif p.state == ProcessState.BLOCKED:
-            p.cpu_usage = 0.0
+            p.cpu_usage = 0.0  # bloqueado no consume CPU
             base_disk = p.disk_base * (1.5 if p.block_reason == BlockReason.IO else 0.5)
             p.disk_usage = self._jitter(base_disk, 0.0, 30.0, 0.12)
             p.mem_usage  = int(self._jitter(p.mem_base, 50, 4096, 0.01))
@@ -187,24 +183,12 @@ class Scheduler:
             p.disk_usage = self._jitter(0.2, 0.0, 2.0, 0.10)
             p.mem_usage  = int(self._jitter(min(128, max(10, p.mem_base*0.1)), 5, 256, 0.10))
 
-    # ---- API pública ----
-    def system_empty(self) -> bool:
-        return not (self.new or self.ready or self.running)
-
-    def get_proc(self, pid: int) -> Optional[Process]:
-        if self.running and self.running.pid == pid: return self.running
-        for lst in (self.ready, self.blocked, self.new, self.finished, self.zombies):
-            for p in lst:
-                if p.pid == pid: return p
-        return None
-
+    # ---- API ----
     def create_process(self, burst: int, name: Optional[str]=None) -> Process:
-        """Crea un proceso con nombre (o aleatorio) y prioridad **automática**."""
         if name is None or not str(name).strip():
             name = self._random_app_name()
-        name = self.unique_name(str(name).strip())
+        name = self.unique_name(name.strip())
         cpu, mem, disk = self._init_resources()
-        # 9) Prioridad automática
         prio = random.choice([Priority.HIGH, Priority.MEDIUM, Priority.LOW])
         p = Process(pid=self.next_pid, name=name, arrival_time=self.time,
                     burst_time=burst, remaining_time=burst, priority=prio,
@@ -215,19 +199,17 @@ class Scheduler:
         return p
 
     def admit_all_new(self):
-        """Admite NEW a READY y aplica 10) prob. de dependencia automática."""
         if not self.new: return
         active_pids = [q.pid for q in ( ([self.running] if self.running else []) + list(self.ready) + self.blocked )]
         for p in list(self.new):
             p.set_state(ProcessState.READY)
             self.ready.append(p)
             self.new.remove(p)
-            # 10) Dependencia automática al admitirse
             if active_pids and random.random() < P_DEPEND_ON_ADMIT:
                 target_pid = random.choice(active_pids)
                 self._set_dependency(p, target_pid)
 
-    # ---- Weighted Round-Robin por CLASE ----
+    # ---- RR ponderado ----
     def _advance_wrr(self):
         self._wrr_idx = (self._wrr_idx + 1) % len(self.PRIO_CYCLE)
         self._wrr_budget = self.WRR_WEIGHTS[self.PRIO_CYCLE[self._wrr_idx]]
@@ -259,38 +241,33 @@ class Scheduler:
             return p
         p = self.ready.popleft(); p.set_state(ProcessState.RUNNING); self._quantum_used = 0; return p
 
-    # ---- Dependencias automáticas ----
+    # ---- Dependencias ----
     def _set_dependency(self, p: Process, target_pid: int):
-        """Bloquea p por dependencia hacia target_pid."""
-        try:
-            self.ready.remove(p)
-        except ValueError:
-            pass
+        try: self.ready.remove(p)
+        except ValueError: pass
         p.block_reason = BlockReason.DEPENDENCY
         p.waiting_for_pid = target_pid
         p.set_state(ProcessState.BLOCKED)
         self.blocked.append(p)
 
     def _auto_reply_from(self, pid: int):
-        """10) Con probabilidad, el RUNNING 'responde' y libera a dependientes que lo esperan."""
         if random.random() >= P_DEPEND_REPLY: return
         for q in list(self.blocked):
             if q.block_reason == BlockReason.DEPENDENCY and q.waiting_for_pid == pid:
                 self.blocked.remove(q)
-                q.block_reason = None; q.waiting_for_pid = None
+                q.block_reason=None; q.waiting_for_pid=None
                 q.set_state(ProcessState.READY)
                 self.ready.append(q)
 
     def _zombify_waiters_of(self, pid: int):
-        """10) Si el proceso objetivo finaliza sin responder, dependientes -> ZOMBIE."""
         for q in list(self.blocked):
             if q.block_reason == BlockReason.DEPENDENCY and q.waiting_for_pid == pid:
                 self.blocked.remove(q)
-                q.block_reason = None; q.waiting_for_pid = None
+                q.block_reason=None; q.waiting_for_pid=None
                 q.set_state(ProcessState.ZOMBIE)
                 self.zombies.append(q)
 
-    # ---- Ciclo de reloj ----
+    # ---- Preempción ----
     def _preempt_running_if_needed(self):
         if not self.running: return
         max_q = PRIO_QUANTUM[self.running.priority]
@@ -298,14 +275,14 @@ class Scheduler:
             self.running.set_state(ProcessState.READY)
             self.ready.append(self.running); self.running=None
 
+    # ---- Tick ----
     def tick(self):
-        """Avanza un tick de reloj: admite NEW, programa, ejecuta, bloquea/finzaliza y actualiza recursos."""
         self.time += 1
 
-        # Admitir NEW (y posibles dependencias automáticas)
+        # Admitir NEW y posibles dependencias
         self.admit_all_new()
 
-        # Desbloquear por I/O que termina
+        # Desbloqueo por I/O
         for p in list(self.blocked):
             if p.block_reason == BlockReason.IO and p.io_remaining > 0:
                 p.io_remaining -= 1
@@ -318,48 +295,46 @@ class Scheduler:
         if self.running is None:
             self.running = self.choose_next()
 
-        # Ejecutar el RUNNING
+        # Ejecutar
         if self.running:
             self.running.has_executed = True
-            # 10) posibilidad de responder a dependientes cada tick
             self._auto_reply_from(self.running.pid)
 
-            # 4) bloqueos I/O siempre con prob. fija
-            if random.random() < P_BLOCK_IO:
-                self.running.block_reason = BlockReason.IO
-                self.running.io_remaining = random.randint(3, 8)
-                self.running.set_state(ProcessState.BLOCKED)
-                self.blocked.append(self.running); self.running = None
-            else:
-                # consumir un tick de CPU
-                self.running.remaining_time -= 1; self._quantum_used += 1
+            # Ejecuta un tick
+            self.running.remaining_time -= 1; self._quantum_used += 1
 
-                # ¿terminó?
-                if self.running.remaining_time <= 0:
-                    finished_pid = self.running.pid
-                    if random.random() < P_FINISH_TO_ZOMBIE:
-                        self.running.set_state(ProcessState.ZOMBIE)
-                        self.zombies.append(self.running)
-                    else:
-                        self.running.set_state(ProcessState.FINISHED)
-                        self.running.finished_at = self.time
-                        self.finished.append(self.running)
-                    # 10) dependientes que aún esperaban -> ZOMBIE
-                    self._zombify_waiters_of(finished_pid)
-                    self.running = None
+            # ¿terminó?
+            if self.running.remaining_time <= 0:
+                finished_pid = self.running.pid
+                if random.random() < P_FINISH_TO_ZOMBIE:
+                    self.running.set_state(ProcessState.ZOMBIE)
+                    self.zombies.append(self.running)
+                else:
+                    self.running.set_state(ProcessState.FINISHED)
+                    self.running.finished_at = self.time
+                    self.finished.append(self.running)
+                self._zombify_waiters_of(finished_pid)
+                self.running = None
+            else:
+                # Posible bloqueo I/O tras ejecutar
+                if random.random() < P_BLOCK_IO:
+                    self.running.block_reason = BlockReason.IO
+                    self.running.io_remaining = random.randint(3, 8)
+                    self.running.set_state(ProcessState.BLOCKED)
+                    self.blocked.append(self.running); self.running = None
                 else:
                     self._preempt_running_if_needed()
 
-        # 11) limpieza de FINISHED tras TTL
+        # Limpieza FINISHED
         for p in list(self.finished):
             if p.finished_at is not None and (self.time - p.finished_at) >= FINISHED_TTL:
                 self.finished.remove(p)
 
-        # Actualizar consumo simulado
+        # Actualizar recursos
         for p in self._all_processes():
             self._update_resources_for(p)
 
-# ---------------- Ventana principal ----------------
+# ---------------- UI ----------------
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -381,13 +356,11 @@ class MainWindow(QMainWindow):
                                            "QToolButton:checked { background-color: #3b82f6; }")
         self.btn_toggle_view.toggled.connect(self.on_toggle_view); header_bar.addWidget(self.btn_toggle_view)
 
-        # Botones principales (se eliminaron los manuales y opciones de configuración)
         self.btn_add = QPushButton("Agregar proceso")
         self.btn_start = QPushButton("▶ Iniciar"); self.btn_pause = QPushButton("⏸ Pausar reloj")
         self.btn_step = QPushButton("⏭ Paso +1 tick")
         self.btn_reset = QPushButton("Reiniciar")
 
-        # Conexiones
         self.btn_add.clicked.connect(self.on_add)
         self.btn_start.clicked.connect(self.on_start)
         self.btn_pause.clicked.connect(self.on_pause_clock)
@@ -397,7 +370,6 @@ class MainWindow(QMainWindow):
         for b in [self.btn_add, self.btn_start, self.btn_pause, self.btn_step, self.btn_reset]:
             b.setMinimumHeight(32); b.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # Panel de controles
         controls_layout = QVBoxLayout(); controls_layout.addLayout(header_bar)
         controls_layout.addWidget(self.lbl_time); controls_layout.addWidget(self.lbl_running)
         controls_layout.addWidget(self.btn_add)
@@ -409,9 +381,9 @@ class MainWindow(QMainWindow):
         controls_container = QWidget(); vwrap = QVBoxLayout(controls_container); vwrap.addWidget(controls_box); vwrap.setContentsMargins(0,0,0,0)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(controls_container); scroll.setMinimumWidth(360); scroll.setMaximumWidth(420)
 
-        # Tabla unificada y vista por secciones
         headers = ["PID","Nombre","Estado","Ticks restantes","Razón","Esperando PID","Prioridad","CPU %","Memoria MB","Disco MB/s"]
         self.tbl_all = QTableWidget(0, len(headers)); self.tbl_all.setHorizontalHeaderLabels(headers)
+        self.tbl_all.setSortingEnabled(False)
         self.tbl_all.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
         processes_box = QGroupBox("Procesos"); pv = QVBoxLayout()
@@ -420,14 +392,17 @@ class MainWindow(QMainWindow):
         self.grouped_container = QWidget(); gvl = QVBoxLayout(self.grouped_container); gvl.setContentsMargins(0,0,0,0)
 
         self.tbl_ready = QTableWidget(0, len(headers)); self.tbl_ready.setHorizontalHeaderLabels(headers)
+        self.tbl_ready.setSortingEnabled(False)
         self.tbl_ready.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         box_rr = QGroupBox("EJECUCIÓN + Listo"); lay_rr = QVBoxLayout(); lay_rr.addWidget(self.tbl_ready); box_rr.setLayout(lay_rr); gvl.addWidget(box_rr)
 
         self.tbl_blocked = QTableWidget(0, len(headers)); self.tbl_blocked.setHorizontalHeaderLabels(headers)
+        self.tbl_blocked.setSortingEnabled(False)
         self.tbl_blocked.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         box_bp = QGroupBox("BLOQUEADO"); lay_bp = QVBoxLayout(); lay_bp.addWidget(self.tbl_blocked); box_bp.setLayout(lay_bp); gvl.addWidget(box_bp)
 
         self.tbl_done = QTableWidget(0, len(headers)); self.tbl_done.setHorizontalHeaderLabels(headers)
+        self.tbl_done.setSortingEnabled(False)
         self.tbl_done.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         box_dz = QGroupBox("FINALIZADO + ZOMBIE"); lay_dz = QVBoxLayout(); lay_dz.addWidget(self.tbl_done); box_dz.setLayout(lay_dz); gvl.addWidget(box_dz)
 
@@ -436,19 +411,17 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(); layout.addWidget(scroll, 0); layout.addWidget(processes_box, 1); root.setLayout(layout)
         self.refresh_table_all()
 
-    # ---- Eventos UI ----
+    # ---- Eventos ----
     def on_add(self):
-        """Agregar proceso: pide nombre (opcional) y usa nombre aleatorio si está vacío."""
         name, ok = QInputDialog.getText(self, "Nuevo proceso", "Nombre del proceso:")
         if not ok or not str(name).strip(): name = None
-        burst = random.randint(7, 15)
+        burst = random.randint(3, 10)
         self.scheduler.create_process(burst, name=name)
         self.scheduler.admit_all_new()
-        if self.scheduler.running is None: self.scheduler.running = self.scheduler.choose_next()
+        # Sin autodespacho: quedará en "Listo" hasta el primer tick
         self.refresh_current_view()
 
     def on_start(self):
-        """Inicia el reloj a 800 ms/tick."""
         if not self.timer.isActive():
             self.timer.start(DEFAULT_TICK_MS)
         self.refresh_current_view()
@@ -464,22 +437,23 @@ class MainWindow(QMainWindow):
         self.timer.stop(); self.scheduler = Scheduler()
         self.refresh_current_view()
 
-    # ---- Ticker ----
     def on_tick(self):
         self.scheduler.tick()
         self.refresh_current_view()
 
-    # ---- Vista ----
     def on_toggle_view(self, checked: bool):
         self.btn_toggle_view.setIcon(self.style().standardIcon(QStyle.SP_FileDialogDetailedView if checked else QStyle.SP_FileDialogListView))
         if checked: self.unified_container.hide(); self.grouped_container.show(); self.refresh_tables_grouped()
         else: self.grouped_container.hide(); self.unified_container.show(); self.refresh_table_all()
 
-    # ---- refresco tablas ----
+    # ---- Refresco tablas ----
     def update_labels(self):
         self.lbl_time.setText(f"Tiempo: {self.scheduler.time}")
         if self.scheduler.running:
-            self.lbl_running.setText(f"EJECUCIÓN: PID {self.scheduler.running.pid} ({self.scheduler.running.name}) (restante={self.scheduler.running.remaining_time}, prio={PRIO_LABEL[self.scheduler.running.priority]})")
+            self.lbl_running.setText(
+                f"EJECUCIÓN: PID {self.scheduler.running.pid} ({self.scheduler.running.name}) "
+                f"(restante={self.scheduler.running.remaining_time}, prio={PRIO_LABEL[self.scheduler.running.priority]})"
+            )
         else:
             self.lbl_running.setText("EJECUCIÓN: -")
 
@@ -495,7 +469,9 @@ class MainWindow(QMainWindow):
     def _fill_table(self, tbl: QTableWidget, items: List[Process]):
         tbl.setRowCount(len(items))
         for r, p in enumerate(items):
-            estado = self._state_text(p.state)
+            # Forzar 'Ejecución' y color verde solo si es el RUNNING actual
+            is_current_running = (self.scheduler.running is not None and p.pid == self.scheduler.running.pid)
+            estado = "Ejecución" if is_current_running else self._state_text(p.state)
             razon = self._reason_text(p.block_reason, p.io_remaining)
             waitfor = str(p.waiting_for_pid) if p.waiting_for_pid is not None else ""
             prio = PRIO_LABEL[p.priority]
@@ -504,22 +480,23 @@ class MainWindow(QMainWindow):
             for c, val in enumerate(cells):
                 item = QTableWidgetItem(val)
                 tbl.setItem(r, c, item)
-                item.setBackground(QBrush(STATE_COLORS.get(p.state)))
+                _color_state = ProcessState.RUNNING if is_current_running else p.state
+                item.setBackground(QBrush(STATE_COLORS.get(_color_state)))
 
     def refresh_tables_grouped(self):
         pro_running = [self.scheduler.running] if self.scheduler.running else []
-        pro_ready = list(self.scheduler.ready)
-        pro_blocked = list(self.scheduler.blocked)
-        pro_finished = list(self.scheduler.finished); pro_zombie = list(self.scheduler.zombies)
-        self._fill_table(self.tbl_ready, [*pro_running, *pro_ready])
-        self._fill_table(self.tbl_blocked, [*pro_blocked])
-        self._fill_table(self.tbl_done, [*pro_finished, *pro_zombie])
+        self._fill_table(self.tbl_ready, [*pro_running, *list(self.scheduler.ready)])
+        self._fill_table(self.tbl_blocked, list(self.scheduler.blocked))
+        self._fill_table(self.tbl_done, [*list(self.scheduler.finished), *list(self.scheduler.zombies)])
 
     def refresh_table_all(self):
-        procs: List[Process] = []
-        if self.scheduler.running: procs.append(self.scheduler.running)
-        procs += list(self.scheduler.ready) + list(self.scheduler.blocked) + list(self.scheduler.zombies) + list(self.scheduler.finished) + list(self.scheduler.new)
-        self._fill_table(self.tbl_all, procs)
+        # RUNNING primero; luego el resto (READY, BLOQUEADO, ZOMBIE, FINISHED, NEW)
+        others: List[Process] = list(self.scheduler.ready) + list(self.scheduler.blocked) + list(self.scheduler.zombies) + list(self.scheduler.finished) + list(self.scheduler.new)
+        if self.scheduler.running:
+            items = [self.scheduler.running] + [p for p in others if p.pid != self.scheduler.running.pid]
+        else:
+            items = others
+        self._fill_table(self.tbl_all, items)
 
     def refresh_current_view(self):
         self.update_labels()
