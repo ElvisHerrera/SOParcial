@@ -1,15 +1,6 @@
-
 # -*- coding: utf-8 -*-
-"""
-Simulador — Estados de los Procesos (orden RUNNING primero)
-- RUNNING siempre se muestra en la primera fila, en verde y con estado "Ejecución".
-- Solo el proceso RUNNING aparece en verde (no se resaltan procesos previos).
-- El primer proceso agregado queda en "Listo" hasta que corre el reloj.
-- READY -> "Listo". Bloqueado no consume CPU. Zombi al finalizar: 0.10.
-- FINISHED se limpia tras 6 ticks.
-- Prioridades automáticas (Alta/Media/Baja) con RR ponderado + quanta (3/2/1).
-- Bloqueos I/O y dependencias automáticos.
-"""
+#Simulador — Estados de los Procesos
+
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -110,12 +101,32 @@ class Process:
     # Marcas
     finished_at: Optional[int] = None
     has_executed: bool = False
+    parent_pid: int | None = None
+    exit_code: int | None = 0
 
     def set_state(self, st: ProcessState):
         self.state = st
 
 # ---------------- Planificador ----------------
 class Scheduler:
+    def _find_pid(self, pid: int | None):
+        if pid is None:
+            return None
+        pools = []
+        if self.running: pools.append([self.running])
+        pools += [list(self.ready), self.blocked, self.finished, self.zombies, self.new]
+        for pool in pools:
+            for p in pool:
+                if p.pid == pid:
+                    return p
+        return None
+
+    def _reap_children_of(self, parent_pid: int):
+        # Simula wait(): elimina de la tabla los zombies cuyo padre es parent_pid
+        if not self.zombies:
+            return
+        self.zombies = [z for z in self.zombies if z.parent_pid != parent_pid]
+    
     WRR_WEIGHTS = {Priority.HIGH:3, Priority.MEDIUM:2, Priority.LOW:2}
     PRIO_CYCLE = [Priority.HIGH, Priority.MEDIUM, Priority.LOW]
 
@@ -193,7 +204,7 @@ class Scheduler:
         p = Process(pid=self.next_pid, name=name, arrival_time=self.time,
                     burst_time=burst, remaining_time=burst, priority=prio,
                     cpu_base=cpu, mem_base=mem, disk_base=disk,
-                    cpu_usage=cpu, mem_usage=mem, disk_usage=disk)
+                    cpu_usage=cpu, mem_usage=mem, disk_usage=disk, parent_pid=self.running.pid if self.running else None)
         self.next_pid += 1
         self.new.append(p)
         return p
@@ -247,6 +258,7 @@ class Scheduler:
         except ValueError: pass
         p.block_reason = BlockReason.DEPENDENCY
         p.waiting_for_pid = target_pid
+        p.parent_pid = target_pid
         p.set_state(ProcessState.BLOCKED)
         self.blocked.append(p)
 
@@ -306,15 +318,19 @@ class Scheduler:
             # ¿terminó?
             if self.running.remaining_time <= 0:
                 finished_pid = self.running.pid
-                if random.random() < P_FINISH_TO_ZOMBIE:
+                parent = self._find_pid(self.running.parent_pid)
+                if parent is not None and parent.state != ProcessState.FINISHED:
+                    # Padre vivo y aún no ha hecho wait(): queda en ZOMBIE
                     self.running.set_state(ProcessState.ZOMBIE)
                     self.zombies.append(self.running)
                 else:
+                    # Sin padre o padre terminado: el SO lo elimina (FINISHED normal)
                     self.running.set_state(ProcessState.FINISHED)
                     self.running.finished_at = self.time
                     self.finished.append(self.running)
-                self._zombify_waiters_of(finished_pid)
                 self.running = None
+                self._zombify_waiters_of(finished_pid)
+                self._reap_children_of(finished_pid)
             else:
                 # Posible bloqueo I/O tras ejecutar
                 if random.random() < P_BLOCK_IO:
@@ -325,6 +341,8 @@ class Scheduler:
                 else:
                     self._preempt_running_if_needed()
 
+                # Recolección automática: el padre en ejecución 'wait()' a sus hijos zombies
+        # Auto reaping while parent runs disabled; reaped on parent finish.
         # Limpieza FINISHED
         for p in list(self.finished):
             if p.finished_at is not None and (self.time - p.finished_at) >= FINISHED_TTL:
@@ -381,7 +399,7 @@ class MainWindow(QMainWindow):
         controls_container = QWidget(); vwrap = QVBoxLayout(controls_container); vwrap.addWidget(controls_box); vwrap.setContentsMargins(0,0,0,0)
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(controls_container); scroll.setMinimumWidth(360); scroll.setMaximumWidth(420)
 
-        headers = ["PID","Nombre","Estado","Ticks restantes","Razón","Esperando PID","Prioridad","CPU %","Memoria MB","Disco MB/s"]
+        headers = ["PID","Nombre","Estado","Ticks restantes","Razón","Esperando PID","Prioridad"]
         self.tbl_all = QTableWidget(0, len(headers)); self.tbl_all.setHorizontalHeaderLabels(headers)
         self.tbl_all.setSortingEnabled(False)
         self.tbl_all.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -475,8 +493,7 @@ class MainWindow(QMainWindow):
             razon = self._reason_text(p.block_reason, p.io_remaining)
             waitfor = str(p.waiting_for_pid) if p.waiting_for_pid is not None else ""
             prio = PRIO_LABEL[p.priority]
-            cells = [str(p.pid), p.name, estado, str(p.remaining_time), razon, waitfor, prio,
-                     f"{p.cpu_usage:.0f}", str(p.mem_usage), f"{p.disk_usage:.1f}"]
+            cells = [str(p.pid), p.name, estado, str(p.remaining_time), razon, waitfor, prio]
             for c, val in enumerate(cells):
                 item = QTableWidgetItem(val)
                 tbl.setItem(r, c, item)
